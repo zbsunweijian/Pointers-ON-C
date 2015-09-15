@@ -1,0 +1,55 @@
+#include <iostream>
+#include <vector>
+using namespace std;
+
+class Solution {
+public:
+	int MaxTask(const vector<int> &tasks) {
+		result = 0;
+		vector<int> path;
+		Dfs(0, path, tasks);
+		return result;
+	}
+private:
+	void Dfs(int index, vector<int> &path, const vector<int> &tasks) {
+		if (index >= tasks.size()) {
+			int i;
+			int sum = 0;
+			for (i = 0; i < path.size(); ++i) 
+				sum += tasks[path[i]];
+			if (sum > result)
+				result = sum;
+			return;
+		}
+
+		Dfs(index + 1, path, tasks);
+
+		if (path.size() < 2 || path[path.size() - 1] != index - 1 
+			|| path[path.size() - 2] != index - 2) {
+				path.push_back(index);
+				Dfs(index + 1, path, tasks);
+				path.pop_back();
+		}
+
+	}
+	int result;
+};
+
+int main()
+{
+	//int arr[] = {40, 10, 10, 90, 90, 120};
+	//vector<int> tasks(arr, arr + sizeof(arr) / sizeof(arr[0]));
+	vector<int> tasks;
+	int count;
+	cin >> count;
+	while (count-- > 0) {
+		int task;
+		cin >> task;
+		tasks.push_back(task);
+	}
+
+	Solution sol;
+	cout << sol.MaxTask(tasks) << endl;
+
+	return 0;
+}
