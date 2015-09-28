@@ -1,0 +1,528 @@
+/*****************************************************
+Project : BTWS
+Version : 1.00
+Date    : 
+Author  : xxxxxx
+Comments:
+
+Chip type           : ATmega32
+Program type        : Application
+Clock frequency     : 8,000000 MHz
+Memory model        : Small
+External SRAM size  : 0
+Data Stack size     : 256
+
+*****************************************************/
+
+
+// includes
+
+#include <mega32.h>
+#include <delay.h>
+#include <math.h>
+#include <stdio.h>
+
+
+
+// definitions
+
+#define FIRST_ADC_INPUT     0
+#define LAST_ADC_INPUT      6
+#define ADC_VREF_TYPE       0x40
+   
+#define Drivesumlimit       65000
+#define Overspeedlimit      40000       // 2/3 of max drive speed
+
+#define total_looptime      2000        // Looptime for filters
+#define ADXL_offset 	    -5;         // Stick Angle offset
+#define ADXL_ZERO           521
+#define GYRO_ZERO           510
+#define ROCKER_ZERO         512
+#define ROCKER_DEADBAND     30
+#define ON	            1
+#define OFF		    0
+#define Run                 1
+#define Standby             0
+
+#define Batt25              664        // AD Value at 25 Volts
+#define Batt_low            235      // 23,5 Volt                       
+
+#define max_PWM             250   // The MOSFET Driver must have a little pulse for Operation   
+
+#define PWM_A               OCR1AL
+#define PWM_B               OCR1BL
+
+#define AD_GYRO             adc_data[2]
+#define AD_ADXL             adc_data[0]
+#define AD_ROCKER           adc_data[5]
+#define AD_Batt             adc_data[6]
+
+#define CW_CCW_A            PORTD.6
+#define CW_CCW_B            PORTD.7
+#define LED1	            PORTC.2
+#define LED2	            PORTC.3
+#define BUZZER	            PORTC.1
+
+
+// global variables
+
+unsigned int    Voltage=0;
+unsigned char   MODE=0;
+  signed long   total_ADXL_GYRO=0;
+  signed long   Average_Gyro=0;
+  signed int    DriveA=0;
+  signed int    DriveB=0;
+  signed long   buf1=0;
+  signed int    buf=0;
+  signed int    buf2=0;
+  signed long   Average_Batt=total_looptime*Batt25;
+  signed int    Tilt_ANGLE=0;
+  signed int    Drive_A=0;
+  signed int    Drive_B=0;
+  signed int    Drivespeed=0;
+  signed int    Steeringsignal=0;
+  signed long   Anglecorrection=0;
+  signed int    Angle_Rate=0;
+  signed long   Balance_moment=0;
+  signed long   Drive_sum=0;
+  signed long   Overspeed=0;
+  signed long   Overspeed_integral=0;
+  
+  bit           Overspeed_flag=0;
+  bit           Batt_low_flag=0;
+
+unsigned char   intervalz=0;
+unsigned char   interval=0;
+
+unsigned int    adc_data[LAST_ADC_INPUT-FIRST_ADC_INPUT+1];
+
+
+
+interrupt [ADC_INT]
+/*
+-----------------------------------------------------------------------------
+Function           : adc_isr()
+ADC interrupt service routine with auto input scanning
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void adc_isr(void)
+{
+    static unsigned char input_index=0;
+    // Read the AD conversion result
+    adc_data[input_index] = ADCW;
+
+
+    // Select next ADC input
+    if (++input_index > (LAST_ADC_INPUT - FIRST_ADC_INPUT))input_index = 0;
+    ADMUX=(FIRST_ADC_INPUT | ADC_VREF_TYPE) + input_index;
+    // Start the AD conversion
+    ADCSRA |= 0x40;
+}
+
+
+ 
+
+/*
+-----------------------------------------------------------------------------
+Function           : Get_Batt_Volt()
+calculate the Battery Voltage
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void Get_Batt_Volt()
+{
+    buf = Average_Batt / total_looptime;
+    Average_Batt -= buf;
+    Average_Batt+=AD_Batt;
+    Voltage=(Average_Batt*10)/80/Batt25;
+}
+
+
+
+
+
+
+
+
+
+/*
+-----------------------------------------------------------------------------
+Function           : Get_Tiltangle()
+calculate the Tilt Angle with a hand made Filter loop,
+calculate the Angle Rate
+
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void Get_Tiltangle()
+{
+    buf = total_ADXL_GYRO / total_looptime;
+    total_ADXL_GYRO -= buf;
+
+    // ADXL part
+    buf = AD_ADXL-ADXL_ZERO + ADXL_offset;	
+    total_ADXL_GYRO += buf;
+
+    // Gyro part
+    buf1 = Average_Gyro / total_looptime;
+    Average_Gyro -= buf1;
+
+    Average_Gyro += AD_GYRO;
+    buf1 = Average_Gyro / (total_looptime / 10);
+
+    // calculate the Angle Rate
+    buf1 = buf1 - AD_GYRO * 10; 	
+    buf1 *= 35;					
+    buf1 /= 100;
+    Angle_Rate = buf1;
+
+    // calculate the Tilt Angle
+    total_ADXL_GYRO += Angle_Rate;
+    Tilt_ANGLE = total_ADXL_GYRO / (total_looptime / 10);
+}
+
+
+ 
+
+/*
+-----------------------------------------------------------------------------
+Function           : Set_PWM()
+limiting and Setting the PWM Signals, and Set the Direction Pins
+Date               : 01.08.2006
+
+
+-----------------------------------------------------------------------------
+*/
+void Set_PWM()
+{
+    if(Drive_A >  max_PWM)Drive_A =  max_PWM;       // limiting PWM Signal A
+    if(Drive_A < -max_PWM)Drive_A = -max_PWM;       // limiting PWM Signal A
+
+    if(Drive_A < 0)                                 // Check direction
+    {
+        DriveA = Drive_A * -1;                      // only positive
+        CW_CCW_A = 1;                               // CW
+    }
+    else
+    {
+        DriveA = Drive_A;
+        CW_CCW_A = 0;                               // CCW
+    }
+    PWM_A = 255 - DriveA;                           // inverse Signal to have a Phase shift from 180бу to Signal PWM B
+
+    if(Drive_B >  max_PWM)Drive_B =  max_PWM;       // limiting PWM Signal B
+    if(Drive_B < -max_PWM)Drive_B = -max_PWM;       // limiting PWM Signal B
+    if(Drive_B < 0)                                 // Check direction
+    {
+        DriveB = Drive_B * -1;                      // only positive
+        CW_CCW_B = 1;                               // CW
+    }
+    else
+    {
+        DriveB = Drive_B;
+        CW_CCW_B = 0;                               // CCW
+    }
+    PWM_B = DriveB;                                 // Set PWM
+}
+
+
+ 
+
+/*
+-----------------------------------------------------------------------------
+Function           : Algorythmus()
+Limit top speed by tilting back, Calculate the Driving speed
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void Algorythmus()
+
+{        
+    Balance_moment =  Angle_Rate*4 +   5 * (Tilt_ANGLE + Anglecorrection);      // calculate balance moment
+
+    Overspeed = lmax(0, Drive_sum - Overspeedlimit);                            // get over speed
+
+    if (Overspeed > 0)
+    {
+        if(MODE == Run)Overspeed_flag = 1;
+
+        Overspeed_integral = lmin(1000, Overspeed_integral + min(500, Overspeed + 125));   // calculate over speed integral
+    }
+    else
+    {
+        Overspeed_flag = 0;
+        Overspeed_integral = lmax(0, Overspeed_integral - 100);                 // calculate over speed integral
+    }
+
+    Anglecorrection = Overspeed / 200 + Overspeed_integral / 125;               // calculate Angle correction
+
+    Drive_sum += Balance_moment;                                                // calculate Drive_sum
+
+    // limitting
+    if(Drive_sum >  Drivesumlimit)Drive_sum = Drivesumlimit;
+    if(Drive_sum <- Drivesumlimit)Drive_sum =-Drivesumlimit;
+
+    Drivespeed = Drive_sum / 250 + Balance_moment / 40;                         // calculate Drive speed
+
+}
+
+
+ 
+
+/*
+-----------------------------------------------------------------------------
+Function           : Signal_Processing()
+Generate Start condition, calculate the left / right steering signal
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void Signal_Processing()
+{
+    if(MODE == Standby)                                           // Standby Mode
+    {
+        Drive_A = 0;
+        Drive_B = 0;
+        Drivespeed=0;  
+        Anglecorrection=0; 
+        Overspeed=0;     
+        Overspeed_integral = 0;
+        Drive_sum = 0;
+        total_ADXL_GYRO = 0;
+        Tilt_ANGLE = 0;   
+        Average_Gyro = total_looptime * GYRO_ZERO;              
+        buf2 = AD_ADXL - ADXL_ZERO + ADXL_offset;
+        if(buf2 == 0)                                                           // The Stick is in Start position initial the System to run
+        {            
+            MODE = Run;
+        }
+
+    }
+    else                                                    // Run operation
+    {
+        Steeringsignal = ROCKER_ZERO - AD_ROCKER;           // get the Steering Signal
+
+        // check Dead band
+        if(Steeringsignal <- ROCKER_DEADBAND)
+        {
+            Steeringsignal += ROCKER_DEADBAND;
+        }
+        else
+        {
+            if(Steeringsignal > ROCKER_DEADBAND)
+            {
+                Steeringsignal -= ROCKER_DEADBAND;
+            }
+            else
+            {
+                Steeringsignal = 0;
+            }
+        }
+
+        // calculate the signal to reduce the differential steering at higher Drive speed
+        Steeringsignal *= 7;
+        buf2 = Drivespeed;
+        if(buf2 < 0)buf2 *= -1;
+        buf2 /= 2;
+        Steeringsignal /= (buf2 + 30);
+
+        Drive_A = Drivespeed + Steeringsignal;                                  // differential Steering
+        Drive_B = Drivespeed - Steeringsignal;                                  // differential Steering
+    }
+}
+
+
+ 
+
+interrupt [TIM0_OVF]
+/*
+-----------------------------------------------------------------------------
+Function           : timer0_ovf_isr()
+Timer loop every 10mSec
+Date               : 01.08.2006
+
+
+-----------------------------------------------------------------------------
+*/
+void timer0_ovf_isr(void)
+{
+    // RONitialize Timer 0 value
+    TCNT0 = 0xB2;							// 10mS
+    Get_Batt_Volt();
+    Get_Tiltangle();
+    Algorythmus();
+    Signal_Processing();
+    Set_PWM();
+    intervalz++;
+    if(intervalz>=20)                                                           // generate 200mSec. interval
+    {
+        intervalz=0;
+        interval=~interval;
+    }
+}
+
+
+/*
+-----------------------------------------------------------------------------
+Function           : init()
+Initial the MCU Hardware
+Date               : 01.08.2006
+
+
+-----------------------------------------------------------------------------
+*/
+void init()
+{
+    // Input/Output Ports initialization
+    // Port A initialization
+    // Func7=In Func6=In Func5=In Func4=In Func3=In Func2=In Func1=In Func0=In
+    // State7=T State6=T State5=T State4=T State3=T State2=T State1=T State0=T
+    PORTA=0x00;
+    DDRA=0x00;
+
+    // Port B initialization
+    // Func7=Out Func6=Out Func5=Out Func4=In Func3=In Func2=In Func1=Out Func0=Out
+    // State7=1 State6=1 State5=1 State4=T State3=T State2=T State1=1 State0=0
+    PORTB=0xE2;
+    DDRB=0xE3;
+
+    // Port C initialization
+    // Func7=Out Func6=Out Func5=Out Func4=Out Func3=Out Func2=Out Func1=Out Func0=Out
+    // State7=0 State6=0 State5=0 State4=0 State3=0 State2=0 State1=0 State0=0
+    PORTC=0x00;
+    DDRC=0xFF;
+
+    // Port D initialization
+    // Func7=Out Func6=Out Func5=Out Func4=Out Func3=Out Func2=Out Func1=Out Func0=Out
+    // State7=0 State6=0 State5=0 State4=0 State3=0 State2=0 State1=0 State0=0
+    PORTD=0x30;
+    DDRD=0xFF;
+
+    // Timer/Counter 0 initialization
+    // Clock source: System Clock
+    // Clock value: 7,813 kHz
+    // Mode: Normal top=FFh
+    // OC0 output: Disconnected
+    TCCR0=0x05;
+    TCNT0=0xB2;
+    OCR0=0x00;
+
+
+
+
+
+    // Timer/Counter 1 initialization
+    // Clock source: System Clock
+    // Clock value: 8000,000 kHz
+    // Mode: Ph. correct PWM top=00FFh
+    // OC1A output: Non-Inv.
+    // OC1B output: Inverted
+    // Noise Canceler: Off
+    // Input Capture on Falling Edge
+    // Timer 1 Overflow Interrupt: Off
+    // Input Capture Interrupt: Off
+    // Compare A Match Interrupt: Off
+    // Compare B Match Interrupt: Off
+
+    TCCR1A=0xB1;
+    TCCR1B=0x01;
+    TCNT1H=0x00;
+    TCNT1L=0x00;
+    ICR1H=0x00;
+    ICR1L=0x00;
+    OCR1AH=0x00;
+    OCR1AL=0xff;
+    OCR1BH=0x00;
+    OCR1BL=0x00;
+
+    // Timer/Counter 2 initialization
+    // Clock source: System Clock
+    // Clock value: Timer 2 Stopped
+    // Mode: Normal top=FFh
+    // OC2 output: Disconnected
+    ASSR=0x00;
+    TCCR2=0x00;
+    TCNT2=0x00;
+    OCR2=0x00;
+
+    // External Interrupt(s) initialization
+    // INT0: Off
+    // INT1: Off
+    // INT2: Off
+    MCUCR=0x00;
+    MCUCSR=0x00;
+
+    // Timer(s)/Counter(s) Interrupt(s) initialization
+    TIMSK=0x01;
+
+    // Analog Comparator initialization
+    // Analog Comparator: Off
+    // Analog Comparator Input Capture by Timer/Counter 1: Off
+    // Analog Comparator Output: Off
+    ACSR=0x80;
+    SFIOR=0x00;
+
+    // ADC initialization
+    // ADC Clock frequency: 62,500 kHz
+    // ADC Voltage Reference: AVCC pin
+    // ADC High Speed Mode: Off
+    // ADC Auto Trigger Source: None
+    ADMUX=FIRST_ADC_INPUT|ADC_VREF_TYPE;
+    ADCSRA=0xCF;
+    SFIOR&=0xEF;
+}
+
+ 
+/*
+-----------------------------------------------------------------------------
+Function           : main()
+Date               : 01.08.2006
+
+-----------------------------------------------------------------------------
+*/
+void main(void)
+{
+init();
+
+#asm("sei")         // Global enable interrupts
+
+delay_ms(500);
+
+
+while (1)
+{
+    // Set debug LED's
+    if(Drivespeed>240 ||  Drivespeed<-240)
+    {
+        LED1 = ON;
+    }
+    else
+    {
+        LED1 = OFF;
+    }
+    if(Drivespeed>180 ||  Drivespeed<-180)
+    {
+        LED2 = ON;
+    }
+    else
+    {
+        LED2 = OFF;
+    }
+
+    if(Voltage < Batt_low)
+    {
+        Batt_low_flag = interval;
+    }
+    else
+    {
+        Batt_low_flag = 0;
+    }
+
+    BUZZER = Overspeed_flag || Batt_low_flag;
+};
+}
